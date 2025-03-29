@@ -24,6 +24,9 @@ mod properties;
 mod receiver;
 mod rust_type_name;
 mod vertex;
+pub mod trace;
+
+use trace::make_iter_with_perf_span;
 
 #[cfg(test)]
 mod tests;
@@ -64,16 +67,16 @@ impl<'a> Adapter<'a> for &'a RustdocAdapter<'a> {
         _resolve_info: &ResolveInfo,
     ) -> VertexIterator<'a, Self::Vertex> {
         match edge_name.as_ref() {
-            "Crate" => Box::new(std::iter::once(Vertex::new_crate(
+            "Crate" => Box::new(make_iter_with_perf_span(std::iter::once(Vertex::new_crate(
                 Origin::CurrentCrate,
                 self.current_crate,
-            ))),
+            )))),
             "CrateDiff" => {
                 let previous_crate = self.previous_crate.expect("no previous crate provided");
-                Box::new(std::iter::once(Vertex {
+                Box::new(make_iter_with_perf_span(std::iter::once(Vertex {
                     origin: Origin::CurrentCrate,
                     kind: VertexKind::CrateDiff((self.current_crate, previous_crate)),
-                }))
+                })))
             }
             _ => unreachable!("resolve_starting_vertices {edge_name}"),
         }
@@ -86,6 +89,7 @@ impl<'a> Adapter<'a> for &'a RustdocAdapter<'a> {
         property_name: &Arc<str>,
         _resolve_info: &ResolveInfo,
     ) -> ContextOutcomeIterator<'a, V, FieldValue> {
+        let _span = tracy_client::span!("resolve_property", 3);
         if property_name.as_ref() == "__typename" {
             Box::new(contexts.map(|ctx| match ctx.active_vertex() {
                 Some(vertex) => {
@@ -232,6 +236,7 @@ impl<'a> Adapter<'a> for &'a RustdocAdapter<'a> {
         parameters: &EdgeParameters,
         resolve_info: &ResolveEdgeInfo,
     ) -> ContextOutcomeIterator<'a, V, VertexIterator<'a, Self::Vertex>> {
+        let _span = tracy_client::span!("resolve_neighbors", 3);
         match type_name.as_ref() {
             "CrateDiff" => edges::resolve_crate_diff_edge(contexts, edge_name),
             "Crate" => edges::resolve_crate_edge(self, contexts, edge_name, resolve_info),
@@ -376,6 +381,7 @@ impl<'a> Adapter<'a> for &'a RustdocAdapter<'a> {
         coerce_to_type: &Arc<str>,
         _resolve_info: &ResolveInfo,
     ) -> ContextOutcomeIterator<'a, V, bool> {
+        let _span = tracy_client::span!("resolve_coercion", 3);
         let coerce_to_type = coerce_to_type.clone();
         match type_name.as_ref() {
             "Item" | "GenericItem" | "Variant" | "FunctionLike" | "Importable" | "ImplOwner"
