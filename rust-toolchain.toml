@@ -2,4 +2,5 @@
 # emits the desired format.
 
 [toolchain]
-channel = "nightly"
+# Temporarily pin to version 43 while I am testing changes. 
+channel = "nightly-2025-03-29"
