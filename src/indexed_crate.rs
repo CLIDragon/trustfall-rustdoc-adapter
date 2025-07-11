@@ -203,6 +203,9 @@ pub struct IndexedCrate<'a> {
     /// -> function item with that export name; exported symbol names must be unique.
     pub(crate) export_name_index: Option<HashMap<&'a str, &'a Item>>,
 
+    /// index: enum id + variant name -> Variant
+    pub(crate) variant_name_index: Option<HashMap<(Id, &'a str), &'a Item>>,
+
     /// Trait items defined in external crates are not present in the `inner: &Crate` field,
     /// even if they are implemented by a type in that crate. This also includes
     /// Rust's built-in traits like `Debug, Send, Eq` etc.
@@ -462,6 +465,7 @@ impl<'a> IndexedCrate<'a> {
             impl_method_index: None,
             fn_owner_index: None,
             export_name_index: None,
+            variant_name_index: None,
             target_features,
         };
 
@@ -504,6 +508,10 @@ impl<'a> IndexedCrate<'a> {
         value.impl_method_index = Some(build_impl_index(&crate_.index).into_inner());
         value.fn_owner_index = Some(build_fn_owner_index(&crate_.index));
         value.export_name_index = Some(build_export_name_index(&crate_.index));
+
+        // TODO: Could we use pub_item_kind_index to construct this index?
+        // I expect it would be faster, but would it lose information?
+        value.variant_name_index = Some(build_variant_name_index(&crate_.index));
 
         value
     }
@@ -665,6 +673,32 @@ fn build_export_name_index(index: &HashMap<Id, Item>) -> HashMap<&str, &Item> {
 
         crate::exported_name::item_export_name(item).map(move |name| (name, item))
     })
+    .collect()
+}
+
+fn build_variant_name_index(index: &HashMap<Id, Item>) -> HashMap<(Id, &str), &Item> {
+    #[cfg(feature = "rayon")]
+    let iter = index.par_iter().map(|(_, value)| value);
+    #[cfg(not(feature = "rayon"))]
+    let iter = index.values();
+
+    iter.filter_map(|item| match &item.inner {
+        rustdoc_types::ItemEnum::Enum(e) => Some(e.variants.iter().copied().map(|id| {
+            let var = index.get(&id).expect("Variant id should be correct.");
+            (
+                (
+                    id,
+                    var.name
+                        .as_ref()
+                        .expect("Variant should have a name.")
+                        .as_str(),
+                ),
+                var,
+            )
+        })),
+        _ => None,
+    })
+    .flatten()
     .collect()
 }
 
