@@ -32,6 +32,8 @@ pub(super) fn resolve_crate_property<'a, V: AsVertex<Vertex<'a>> + 'a>(
     }
 }
 
+use trustfall::provider::Typename;
+
 pub(super) fn resolve_item_property<'a, V: AsVertex<Vertex<'a>> + 'a>(
     contexts: ContextIterator<'a, V>,
     property_name: &str,
@@ -42,7 +44,13 @@ pub(super) fn resolve_item_property<'a, V: AsVertex<Vertex<'a>> + 'a>(
             field_property!(as_item, id, { id.0.to_string().into() }),
         ),
         "crate_id" => resolve_property_with(contexts, field_property!(as_item, crate_id)),
-        "name" => resolve_property_with(contexts, field_property!(as_item, name)),
+        "name" => resolve_property_with(contexts, move |vertex| {
+            let vertex = vertex.as_item().unwrap_or_else(|| {
+                panic!("conversion failed, unexpected vertex kind: {vertex:#?}")
+            });
+            println!("{:?}", vertex.name);
+            vertex.name.clone().into()
+        }),
         "docs" => resolve_property_with(contexts, field_property!(as_item, docs)),
         "attrs" => resolve_property_with(contexts, field_property!(as_item, attrs)),
         "deprecated" => resolve_property_with(
@@ -67,6 +75,9 @@ pub(super) fn resolve_item_property<'a, V: AsVertex<Vertex<'a>> + 'a>(
             // An item that is not eligible by itself cannot be part of the public API,
             // but eligible items might not be public API -- for example, pub-in-priv items
             // (public items in a private module) are eligible but not public API.
+            if matches!(vertex.as_vertex().unwrap().typename(), "PlainVariant" | "TupleVariant" | "StructVariant") {
+                println!("(API) >>> {:?}", vertex.as_item().unwrap().name);
+            }
             let item = vertex.as_item().expect("vertex was not an Item");
             let is_public = matches!(item.visibility, Visibility::Public | Visibility::Default);
             (is_public

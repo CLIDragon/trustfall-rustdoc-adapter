@@ -526,13 +526,28 @@ pub(super) fn resolve_variant_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
         _ => unreachable!("resolve_variant_edge {edge_name}"),
     }
 }
+use trustfall::provider::VertexInfo;
 
 pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
+    adapter: &'a RustdocAdapter<'a>,
     contexts: ContextIterator<'a, V>,
     edge_name: &str,
     current_crate: &'a PackageIndex<'a>,
     previous_crate: Option<&'a PackageIndex<'a>>,
+    resolve_info: &ResolveEdgeInfo,
 ) -> ContextOutcomeIterator<'a, V, VertexIterator<'a, Vertex<'a>>> {
+
+    println!("=== Resolve Info");
+    // println!("destination: {:?}", resolve_info.destination());
+    // println!("edge: {:?}", resolve_info.edge());
+    println!("Static Destination: {:?}", resolve_info.destination().statically_required_property("name"));
+    if let Some(dynamic_value) = resolve_info.destination().dynamically_required_property("name") {
+        // println!("Dynamic Destination: {:?}", &dynamic_value);
+        return dynamic_value.resolve_with(&adapter, contexts, |vertex, candidate| {
+            println!("Candidate {:?}", candidate);
+            Box::new(std::iter::empty())
+        });
+    }
     match edge_name {
         "variant" => resolve_neighbors_with(contexts, move |vertex| {
             let origin = vertex.origin;
@@ -598,6 +613,9 @@ pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
                         }
                     })
                     .collect();
+                println!("---");
+                println!("Enum: {:?}", outer_item.name);
+                println!("{:?}", variants);
 
                 if has_repr || !has_fields_in_variants {
                     Some(Rc::new(LazyDiscriminants::new(variants)))

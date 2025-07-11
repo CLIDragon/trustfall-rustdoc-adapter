@@ -350,10 +350,12 @@ impl<'a> Adapter<'a> for &'a RustdocAdapter<'a> {
                 )
             }
             "Enum" => edges::resolve_enum_edge(
+                self,
                 contexts,
                 edge_name,
                 self.current_crate,
                 self.previous_crate,
+                resolve_info,
             ),
             "Union" => edges::resolve_union_edge(
                 contexts,
