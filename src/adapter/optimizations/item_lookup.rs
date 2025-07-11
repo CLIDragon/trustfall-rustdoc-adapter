@@ -548,7 +548,7 @@ fn resolve_items_slow_path<'a>(
     resolve_item_vertices(origin, items)
 }
 
-fn resolve_item_vertices<'a>(
+pub(crate) fn resolve_item_vertices<'a>(
     origin: Origin,
     items: impl Iterator<Item = &'a Item> + 'a,
 ) -> VertexIterator<'a, Vertex<'a>> {

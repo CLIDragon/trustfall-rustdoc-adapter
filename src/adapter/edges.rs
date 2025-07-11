@@ -1,11 +1,15 @@
 use std::{collections::BTreeSet, num::NonZeroUsize, rc::Rc};
 
 use rustdoc_types::{
-    GenericBound::TraitBound, GenericParamDefKind, Id, ItemEnum, VariantKind, WherePredicate,
+    Enum, GenericBound::TraitBound, GenericParamDefKind, Id, Item, ItemEnum, VariantKind,
+    WherePredicate,
 };
-use trustfall::provider::{
-    AsVertex, ContextIterator, ContextOutcomeIterator, ResolveEdgeInfo, VertexIterator,
-    resolve_neighbors_with,
+use trustfall::{
+    FieldValue,
+    provider::{
+        AsVertex, CandidateValue, ContextIterator, ContextOutcomeIterator, ResolveEdgeInfo,
+        VertexIterator, resolve_neighbors_with,
+    },
 };
 
 use crate::{
@@ -18,7 +22,7 @@ use crate::{
 use super::{
     RustdocAdapter,
     enum_variant::LazyDiscriminants,
-    optimizations,
+    optimizations::{self, item_lookup::resolve_item_vertices},
     origin::Origin,
     receiver::Receiver,
     vertex::{Feature, Vertex},
@@ -528,116 +532,177 @@ pub(super) fn resolve_variant_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
 }
 use trustfall::provider::VertexInfo;
 
+fn resolve_enum_variants_slow_path<'a>(
+    adapter: &'a RustdocAdapter<'a>,
+    vertex: &Vertex<'a>,
+) -> VertexIterator<'a, Vertex<'a>> {
+    let origin = vertex.origin;
+    let enum_item = vertex.as_enum().expect("vertex was not an Enum");
+    let outer_item = vertex.as_item().expect("enum was not a vertex");
+
+    let item_index = match origin {
+        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
+        Origin::PreviousCrate => {
+            &adapter
+                .previous_crate
+                .expect("no previous crate provided")
+                .own_crate
+                .inner
+                .index
+        }
+    };
+
+    let discriminants = {
+        // Discriminants are only well-defined if either:
+        // - the enum has a defined `repr` binary representation, or
+        // - none of the enum variants contain any fields of their own.
+
+        let has_repr = outer_item.attrs.iter().any(move |attr| {
+            let parsed_attr = Attribute::new(attr.as_str());
+
+            parsed_attr.content.base == "repr"
+                && parsed_attr.content.arguments.iter().flatten().any(|repr| {
+                    repr.base == "isize"
+                        || repr.base == "usize"
+                        || repr
+                            .base
+                            .strip_prefix("i")
+                            .map(|num| num.chars().all(|c| c.is_ascii_digit()))
+                            .unwrap_or(false)
+                        || repr
+                            .base
+                            .strip_prefix("u")
+                            .map(|num| num.chars().all(|c| c.is_ascii_digit()))
+                            .unwrap_or(false)
+                })
+        });
+
+        let mut has_fields_in_variants = false;
+        let variants = enum_item
+            .variants
+            .iter()
+            .map(|field_id| {
+                let inner = &item_index.get(field_id).expect("missing item").inner;
+                match inner {
+                    ItemEnum::Variant(v) => {
+                        match &v.kind {
+                            VariantKind::Plain => {}
+                            VariantKind::Tuple(t) => has_fields_in_variants |= !t.is_empty(),
+                            VariantKind::Struct { fields, .. } => {
+                                has_fields_in_variants |= fields.is_empty()
+                            }
+                        }
+                        v
+                    }
+                    _ => unreachable!("Item {inner:?} not a Variant"),
+                }
+            })
+            .collect();
+        println!("---");
+        println!("Enum: {:?}", outer_item.name);
+        println!("{:?}", variants);
+
+        if has_repr || !has_fields_in_variants {
+            Some(Rc::new(LazyDiscriminants::new(variants)))
+        } else {
+            None
+        }
+    };
+
+    Box::new(
+        enum_item
+            .variants
+            .iter()
+            .enumerate()
+            .map(move |(index, field_id)| {
+                origin.make_variant_vertex(
+                    item_index.get(field_id).expect("missing item"),
+                    discriminants.clone(),
+                    index,
+                )
+            }),
+    )
+}
+
+fn resolve_enum_variant_by_name<'a>(
+    origin: Origin,
+    variant_name_index: &'a HashMap<(Id, &str), &'a Item>,
+    vertex: &Item,
+    name: FieldValue,
+) -> VertexIterator<'a, Vertex<'a>> {
+    // let enum_item = vertex.as_item().expect("Vertex was not an Item");
+    let enum_item = vertex;
+    match name {
+        FieldValue::String(name) => match variant_name_index.get(&(enum_item.id, &name)) {
+            Some(&item) => Box::new(resolve_item_vertices(origin, std::iter::once(item))),
+            None => Box::new(std::iter::empty()),
+        },
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
 pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
     adapter: &'a RustdocAdapter<'a>,
     contexts: ContextIterator<'a, V>,
     edge_name: &str,
-    current_crate: &'a PackageIndex<'a>,
-    previous_crate: Option<&'a PackageIndex<'a>>,
     resolve_info: &ResolveEdgeInfo,
 ) -> ContextOutcomeIterator<'a, V, VertexIterator<'a, Vertex<'a>>> {
-
-    println!("=== Resolve Info");
-    // println!("destination: {:?}", resolve_info.destination());
-    // println!("edge: {:?}", resolve_info.edge());
-    println!("Static Destination: {:?}", resolve_info.destination().statically_required_property("name"));
-    if let Some(dynamic_value) = resolve_info.destination().dynamically_required_property("name") {
-        // println!("Dynamic Destination: {:?}", &dynamic_value);
-        return dynamic_value.resolve_with(&adapter, contexts, |vertex, candidate| {
-            println!("Candidate {:?}", candidate);
-            Box::new(std::iter::empty())
-        });
-    }
     match edge_name {
-        "variant" => resolve_neighbors_with(contexts, move |vertex| {
-            let origin = vertex.origin;
-            let enum_item = vertex.as_enum().expect("vertex was not an Enum");
-            let outer_item = vertex.as_item().expect("enum was not a vertex");
+        "variant" => {
+            // TODO: Static value.
+            // If we know the name, we can use the variant_name_index to speed up the
+            // creation.
+            if let Some(dynamic_value) = resolve_info
+                .destination()
+                .dynamically_required_property("name")
+            {
+                // println!("Dynamic Destination: {:?}", &dynamic_value);
+                return dynamic_value.resolve_with(&adapter, contexts, |vertex, candidate| {
+                    let origin = vertex.origin;
 
-            let item_index = match origin {
-                Origin::CurrentCrate => &current_crate.own_crate.inner.index,
-                Origin::PreviousCrate => {
-                    &previous_crate
-                        .expect("no previous crate provided")
-                        .own_crate
-                        .inner
-                        .index
-                }
-            };
+                    let variant_name_index = match origin {
+                        Origin::CurrentCrate => adapter
+                            .current_crate
+                            .own_crate
+                            .variant_name_index
+                            .as_ref()
+                            .expect("variant_name_index was never constructed."),
+                        Origin::PreviousCrate => adapter
+                            .previous_crate
+                            .expect("no previous crate provided")
+                            .own_crate
+                            .variant_name_index
+                            .as_ref()
+                            .expect("variant_name_index was never constructed."),
+                    };
 
-            let discriminants = {
-                // Discriminants are only well-defined if either:
-                // - the enum has a defined `repr` binary representation, or
-                // - none of the enum variants contain any fields of their own.
-
-                let has_repr = outer_item.attrs.iter().any(move |attr| {
-                    let parsed_attr = Attribute::new(attr.as_str());
-
-                    parsed_attr.content.base == "repr"
-                        && parsed_attr.content.arguments.iter().flatten().any(|repr| {
-                            repr.base == "isize"
-                                || repr.base == "usize"
-                                || repr
-                                    .base
-                                    .strip_prefix("i")
-                                    .map(|num| num.chars().all(|c| c.is_ascii_digit()))
-                                    .unwrap_or(false)
-                                || repr
-                                    .base
-                                    .strip_prefix("u")
-                                    .map(|num| num.chars().all(|c| c.is_ascii_digit()))
-                                    .unwrap_or(false)
-                        })
-                });
-
-                let mut has_fields_in_variants = false;
-                let variants = enum_item
-                    .variants
-                    .iter()
-                    .map(|field_id| {
-                        let inner = &item_index.get(field_id).expect("missing item").inner;
-                        match inner {
-                            ItemEnum::Variant(v) => {
-                                match &v.kind {
-                                    VariantKind::Plain => {}
-                                    VariantKind::Tuple(t) => {
-                                        has_fields_in_variants |= !t.is_empty()
-                                    }
-                                    VariantKind::Struct { fields, .. } => {
-                                        has_fields_in_variants |= fields.is_empty()
-                                    }
-                                }
-                                v
-                            }
-                            _ => unreachable!("Item {inner:?} not a Variant"),
+                    match candidate {
+                        CandidateValue::Impossible => Box::new(std::iter::empty()),
+                        CandidateValue::Single(name) => resolve_enum_variant_by_name(
+                            vertex.origin,
+                            &variant_name_index,
+                            vertex.as_item().expect("vertex is not an item."),
+                            name,
+                        ),
+                        CandidateValue::Multiple(values) => {
+                            Box::new(values.into_iter().flat_map(move |name| {
+                                resolve_enum_variant_by_name(
+                                    vertex.origin,
+                                    &variant_name_index,
+                                    vertex.as_item().expect("vertex is not an item."),
+                                    name,
+                                )
+                            }))
                         }
-                    })
-                    .collect();
-                println!("---");
-                println!("Enum: {:?}", outer_item.name);
-                println!("{:?}", variants);
-
-                if has_repr || !has_fields_in_variants {
-                    Some(Rc::new(LazyDiscriminants::new(variants)))
-                } else {
-                    None
-                }
-            };
-
-            Box::new(
-                enum_item
-                    .variants
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, field_id)| {
-                        origin.make_variant_vertex(
-                            item_index.get(field_id).expect("missing item"),
-                            discriminants.clone(),
-                            index,
-                        )
-                    }),
-            )
-        }),
+                        _ => resolve_enum_variants_slow_path(adapter, vertex),
+                    }
+                });
+            } else {
+                resolve_neighbors_with(contexts, |vertex| {
+                    resolve_enum_variants_slow_path(adapter, vertex)
+                })
+            }
+        }
         _ => unreachable!("resolve_enum_edge {edge_name}"),
     }
 }
