@@ -212,7 +212,7 @@ pub struct IndexedCrate<'a> {
     pub(crate) pub_item_kind_index: PubItemKindIndex<'a>,
     
     /// index: enum id + variant name -> Variant
-    pub(crate) variant_name_index: Option<HashMap<(Id, &'a str), &'a Item>>,
+    pub(crate) variant_name_index: Option<HashMap<(Id, &'a str), (&'a Item, usize)>>,
 
     /// Trait items defined in external crates are not present in the `inner: &Crate` field,
     /// even if they are implemented by a type in that crate. This also includes
@@ -610,6 +610,8 @@ impl<'a> IndexedCrate<'a> {
         // I expect it would be faster, but would it lose information?
         value.variant_name_index = Some(build_variant_name_index(&crate_.index));
 
+        // println!("{:?}", value.variant_name_index);
+
         value
     }
 
@@ -773,15 +775,24 @@ fn build_export_name_index(index: &HashMap<Id, Item>) -> HashMap<&str, &Item> {
     .collect()
 }
 
-fn build_variant_name_index(index: &HashMap<Id, Item>) -> HashMap<(Id, &str), &Item> {
+fn build_variant_name_index(index: &HashMap<Id, Item>) -> HashMap<(Id, &str), (&Item, usize)> {
     #[cfg(feature = "rayon")]
     let iter = index.par_iter().map(|(_, value)| value);
     #[cfg(not(feature = "rayon"))]
     let iter = index.values();
 
     iter.filter_map(|item| match &item.inner {
-        rustdoc_types::ItemEnum::Enum(e) => Some(e.variants.iter().copied().map(|id| {
-            let var = index.get(&id).expect("Variant id should be correct.");
+        rustdoc_types::ItemEnum::Enum(e) => Some((item.id, e)),
+        _ => None,
+    })
+    .flat_map(|(id, enum_item)| {
+        #[cfg(feature = "rayon")]
+        let base_iter = enum_item.variants.par_iter();
+        #[cfg(not(feature = "rayon"))]
+        let base_iter = enum_item.variants.iter();
+
+        base_iter.copied().enumerate().map(move |(i, var_id)| {
+            let var = index.get(&var_id).expect("Variant id should be correct.");
             (
                 (
                     id,
@@ -790,12 +801,11 @@ fn build_variant_name_index(index: &HashMap<Id, Item>) -> HashMap<(Id, &str), &I
                         .expect("Variant should have a name.")
                         .as_str(),
                 ),
-                var,
+                (var, i)
+
             )
-        })),
-        _ => None,
+        })
     })
-    .flatten()
     .collect()
 }
 

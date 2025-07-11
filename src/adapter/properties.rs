@@ -48,7 +48,7 @@ pub(super) fn resolve_item_property<'a, V: AsVertex<Vertex<'a>> + 'a>(
             let vertex = vertex.as_item().unwrap_or_else(|| {
                 panic!("conversion failed, unexpected vertex kind: {vertex:#?}")
             });
-            println!("{:?}", vertex.name);
+            // println!("{:?}", vertex.name);
             vertex.name.clone().into()
         }),
         "docs" => resolve_property_with(contexts, field_property!(as_item, docs)),
@@ -75,12 +75,12 @@ pub(super) fn resolve_item_property<'a, V: AsVertex<Vertex<'a>> + 'a>(
             // An item that is not eligible by itself cannot be part of the public API,
             // but eligible items might not be public API -- for example, pub-in-priv items
             // (public items in a private module) are eligible but not public API.
-            if matches!(
-                vertex.as_vertex().unwrap().typename(),
-                "PlainVariant" | "TupleVariant" | "StructVariant"
-            ) {
-                println!("(API) >>> {:?}", vertex.as_item().unwrap().name);
-            }
+            // if matches!(
+            //     vertex.as_vertex().unwrap().typename(),
+            //     "PlainVariant" | "TupleVariant" | "StructVariant"
+            // ) {
+            //     println!("(API) >>> {:?}", vertex.as_item().unwrap().name);
+            // }
             let item = vertex.as_item().expect("vertex was not an Item");
             let is_public = matches!(item.visibility, Visibility::Public | Visibility::Default);
             (is_public

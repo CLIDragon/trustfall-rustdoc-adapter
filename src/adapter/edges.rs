@@ -532,27 +532,8 @@ pub(super) fn resolve_variant_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
 }
 use trustfall::provider::VertexInfo;
 
-fn resolve_enum_variants_slow_path<'a>(
-    adapter: &'a RustdocAdapter<'a>,
-    vertex: &Vertex<'a>,
-) -> VertexIterator<'a, Vertex<'a>> {
-    let origin = vertex.origin;
-    let enum_item = vertex.as_enum().expect("vertex was not an Enum");
-    let outer_item = vertex.as_item().expect("enum was not a vertex");
 
-    let item_index = match origin {
-        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
-        Origin::PreviousCrate => {
-            &adapter
-                .previous_crate
-                .expect("no previous crate provided")
-                .own_crate
-                .inner
-                .index
-        }
-    };
-
-    let discriminants = {
+fn compute_variant_discriminants<'a>(outer_item: &'a Item, enum_item: &'a Enum, item_index: &'a HashMap<Id, Item>) -> Option<Rc<LazyDiscriminants<'a>>> {
         // Discriminants are only well-defined if either:
         // - the enum has a defined `repr` binary representation, or
         // - none of the enum variants contain any fields of their own.
@@ -598,16 +579,35 @@ fn resolve_enum_variants_slow_path<'a>(
                 }
             })
             .collect();
-        println!("---");
-        println!("Enum: {:?}", outer_item.name);
-        println!("{:?}", variants);
 
         if has_repr || !has_fields_in_variants {
             Some(Rc::new(LazyDiscriminants::new(variants)))
         } else {
             None
         }
+}
+
+fn resolve_enum_variants_slow_path<'a>(
+    adapter: &'a RustdocAdapter<'a>,
+    vertex: &Vertex<'a>,
+) -> VertexIterator<'a, Vertex<'a>> {
+    let origin = vertex.origin;
+    let enum_item = vertex.as_enum().expect("vertex was not an Enum");
+    let outer_item = vertex.as_item().expect("enum was not a vertex");
+
+    let item_index = match origin {
+        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
+        Origin::PreviousCrate => {
+            &adapter
+                .previous_crate
+                .expect("no previous crate provided")
+                .own_crate
+                .inner
+                .index
+        }
     };
+
+    let discriminants = compute_variant_discriminants(outer_item, enum_item, item_index);
 
     Box::new(
         enum_item
@@ -626,17 +626,22 @@ fn resolve_enum_variants_slow_path<'a>(
 
 fn resolve_enum_variant_by_name<'a>(
     origin: Origin,
-    variant_name_index: &'a HashMap<(Id, &str), &'a Item>,
-    vertex: &Item,
+    variant_name_index: &'a HashMap<(Id, &str), (&'a Item, usize)>,
+    vertex: &'a Item,
     name: FieldValue,
 ) -> VertexIterator<'a, Vertex<'a>> {
-    // let enum_item = vertex.as_item().expect("Vertex was not an Item");
     let enum_item = vertex;
     match name {
-        FieldValue::String(name) => match variant_name_index.get(&(enum_item.id, &name)) {
-            Some(&item) => Box::new(resolve_item_vertices(origin, std::iter::once(item))),
+        FieldValue::String(name) => {
+            // println!("Key: {:?}", (&(enum_item.id, &name)));
+            match variant_name_index.get(&(enum_item.id, &name)) {
+            Some((&item, index)) => Box::new(std::iter::once(origin.make_variant_vertex(
+                    vertex,
+                    discriminants.clone(),
+                    index.clone(),
+                ))),
             None => Box::new(std::iter::empty()),
-        },
+        }},
         _ => Box::new(std::iter::empty()),
     }
 }
@@ -650,15 +655,16 @@ pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
     match edge_name {
         "variant" => {
             // TODO: Static value.
-            // If we know the name, we can use the variant_name_index to speed up the
-            // creation.
+            // If we know the name, we can use the variant_name_index find the corresponding
+            // variant.
             if let Some(dynamic_value) = resolve_info
                 .destination()
                 .dynamically_required_property("name")
             {
                 // println!("Dynamic Destination: {:?}", &dynamic_value);
-                return dynamic_value.resolve_with(&adapter, contexts, |vertex, candidate| {
+                return dynamic_value.resolve_with(&adapter, contexts, move |vertex, candidate| {
                     let origin = vertex.origin;
+                    let vertex_item = vertex.as_item().expect("vertex is not an item.");
 
                     let variant_name_index = match origin {
                         Origin::CurrentCrate => adapter
@@ -675,21 +681,22 @@ pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
                             .as_ref()
                             .expect("variant_name_index was never constructed."),
                     };
+                    // println!("{:?} {:?}, {:?}", vertex_item.name, origin, candidate);
 
                     match candidate {
                         CandidateValue::Impossible => Box::new(std::iter::empty()),
                         CandidateValue::Single(name) => resolve_enum_variant_by_name(
-                            vertex.origin,
-                            &variant_name_index,
-                            vertex.as_item().expect("vertex is not an item."),
+                            origin,
+                            variant_name_index,
+                            vertex_item,
                             name,
                         ),
                         CandidateValue::Multiple(values) => {
                             Box::new(values.into_iter().flat_map(move |name| {
                                 resolve_enum_variant_by_name(
-                                    vertex.origin,
-                                    &variant_name_index,
-                                    vertex.as_item().expect("vertex is not an item."),
+                                    origin,
+                                    variant_name_index,
+                                    vertex_item,
                                     name,
                                 )
                             }))
