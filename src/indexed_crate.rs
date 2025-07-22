@@ -210,7 +210,7 @@ pub struct IndexedCrate<'a> {
 
     /// index: kind of public top-level item -> `IndexMap<Id, &'a Item>` of that kind
     pub(crate) pub_item_kind_index: PubItemKindIndex<'a>,
-    
+
     /// index: enum id + variant name -> Variant
     pub(crate) variant_name_index: Option<HashMap<(Id, &'a str), (&'a Item, usize)>>,
 
@@ -801,8 +801,7 @@ fn build_variant_name_index(index: &HashMap<Id, Item>) -> HashMap<(Id, &str), (&
                         .expect("Variant should have a name.")
                         .as_str(),
                 ),
-                (var, i)
-
+                (var, i),
             )
         })
     })

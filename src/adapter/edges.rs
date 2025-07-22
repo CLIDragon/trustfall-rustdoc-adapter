@@ -4,6 +4,7 @@ use rustdoc_types::{
     Enum, GenericBound::TraitBound, GenericParamDefKind, Id, Item, ItemEnum, VariantKind,
     WherePredicate,
 };
+use trustfall::provider::VertexInfo;
 use trustfall::{
     FieldValue,
     provider::{
@@ -22,7 +23,7 @@ use crate::{
 use super::{
     RustdocAdapter,
     enum_variant::LazyDiscriminants,
-    optimizations::{self, item_lookup::resolve_item_vertices},
+    optimizations::{self},
     origin::Origin,
     receiver::Receiver,
     vertex::{Feature, Vertex},
@@ -530,84 +531,78 @@ pub(super) fn resolve_variant_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
         _ => unreachable!("resolve_variant_edge {edge_name}"),
     }
 }
-use trustfall::provider::VertexInfo;
 
+fn compute_variant_discriminants<'a>(
+    outer_item: &'a Item,
+    item_index: &'a HashMap<Id, Item>,
+) -> Option<Rc<LazyDiscriminants<'a>>> {
+    // Discriminants are only well-defined if either:
+    // - the enum has a defined `repr` binary representation, or
+    // - none of the enum variants contain any fields of their own.
+    let has_repr = outer_item.attrs.iter().any(move |attr| {
+        let parsed_attr = Attribute::new(attr.as_str());
 
-fn compute_variant_discriminants<'a>(outer_item: &'a Item, enum_item: &'a Enum, item_index: &'a HashMap<Id, Item>) -> Option<Rc<LazyDiscriminants<'a>>> {
-        // Discriminants are only well-defined if either:
-        // - the enum has a defined `repr` binary representation, or
-        // - none of the enum variants contain any fields of their own.
-
-        let has_repr = outer_item.attrs.iter().any(move |attr| {
-            let parsed_attr = Attribute::new(attr.as_str());
-
-            parsed_attr.content.base == "repr"
-                && parsed_attr.content.arguments.iter().flatten().any(|repr| {
-                    repr.base == "isize"
-                        || repr.base == "usize"
-                        || repr
-                            .base
-                            .strip_prefix("i")
-                            .map(|num| num.chars().all(|c| c.is_ascii_digit()))
-                            .unwrap_or(false)
-                        || repr
-                            .base
-                            .strip_prefix("u")
-                            .map(|num| num.chars().all(|c| c.is_ascii_digit()))
-                            .unwrap_or(false)
-                })
-        });
-
-        let mut has_fields_in_variants = false;
-        let variants = enum_item
-            .variants
-            .iter()
-            .map(|field_id| {
-                let inner = &item_index.get(field_id).expect("missing item").inner;
-                match inner {
-                    ItemEnum::Variant(v) => {
-                        match &v.kind {
-                            VariantKind::Plain => {}
-                            VariantKind::Tuple(t) => has_fields_in_variants |= !t.is_empty(),
-                            VariantKind::Struct { fields, .. } => {
-                                has_fields_in_variants |= fields.is_empty()
-                            }
-                        }
-                        v
-                    }
-                    _ => unreachable!("Item {inner:?} not a Variant"),
-                }
+        parsed_attr.content.base == "repr"
+            && parsed_attr.content.arguments.iter().flatten().any(|repr| {
+                repr.base == "isize"
+                    || repr.base == "usize"
+                    || repr
+                        .base
+                        .strip_prefix("i")
+                        .map(|num| num.chars().all(|c| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                    || repr
+                        .base
+                        .strip_prefix("u")
+                        .map(|num| num.chars().all(|c| c.is_ascii_digit()))
+                        .unwrap_or(false)
             })
-            .collect();
+    });
 
-        if has_repr || !has_fields_in_variants {
-            Some(Rc::new(LazyDiscriminants::new(variants)))
-        } else {
-            None
-        }
+    let enum_item = match &outer_item.inner {
+        ItemEnum::Enum(x) => x,
+        _ => panic!(),
+    };
+
+    let mut has_fields_in_variants = false;
+    let variants = enum_item
+        .variants
+        .iter()
+        .map(|field_id| {
+            let inner = &item_index.get(field_id).expect("missing item").inner;
+            match inner {
+                ItemEnum::Variant(v) => {
+                    match &v.kind {
+                        VariantKind::Plain => {}
+                        VariantKind::Tuple(t) => has_fields_in_variants |= !t.is_empty(),
+                        VariantKind::Struct { fields, .. } => {
+                            has_fields_in_variants |= fields.is_empty()
+                        }
+                    }
+                    v
+                }
+                _ => unreachable!("Item {inner:?} not a Variant"),
+            }
+        })
+        .collect();
+
+    if has_repr || !has_fields_in_variants {
+        Some(Rc::new(LazyDiscriminants::new(variants)))
+    } else {
+        None
+    }
 }
 
 fn resolve_enum_variants_slow_path<'a>(
-    adapter: &'a RustdocAdapter<'a>,
-    vertex: &Vertex<'a>,
+    origin: Origin,
+    item_vertex: &'a Item,
+    item_index: &'a HashMap<Id, Item>,
 ) -> VertexIterator<'a, Vertex<'a>> {
-    let origin = vertex.origin;
-    let enum_item = vertex.as_enum().expect("vertex was not an Enum");
-    let outer_item = vertex.as_item().expect("enum was not a vertex");
-
-    let item_index = match origin {
-        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
-        Origin::PreviousCrate => {
-            &adapter
-                .previous_crate
-                .expect("no previous crate provided")
-                .own_crate
-                .inner
-                .index
-        }
+    let discriminants = compute_variant_discriminants(item_vertex, item_index);
+    let enum_item = match &item_vertex.inner {
+        ItemEnum::Enum(x) => x,
+        _ => panic!(),
     };
-
-    let discriminants = compute_variant_discriminants(outer_item, enum_item, item_index);
 
     Box::new(
         enum_item
@@ -626,23 +621,45 @@ fn resolve_enum_variants_slow_path<'a>(
 
 fn resolve_enum_variant_by_name<'a>(
     origin: Origin,
-    variant_name_index: &'a HashMap<(Id, &str), (&'a Item, usize)>,
-    vertex: &'a Item,
+    item_vertex: &'a Item,
     name: FieldValue,
+    variant_name_index: &'a HashMap<(Id, &str), (&'a Item, usize)>,
+    item_index: &'a HashMap<Id, Item>,
 ) -> VertexIterator<'a, Vertex<'a>> {
-    let enum_item = vertex;
     match name {
-        FieldValue::String(name) => {
-            // println!("Key: {:?}", (&(enum_item.id, &name)));
-            match variant_name_index.get(&(enum_item.id, &name)) {
-            Some((&item, index)) => Box::new(std::iter::once(origin.make_variant_vertex(
-                    vertex,
+        FieldValue::String(name) => match variant_name_index.get(&(item_vertex.id, &name)) {
+            Some((item, index)) => {
+                let discriminants = compute_variant_discriminants(item_vertex, item_index);
+                Box::new(std::iter::once(origin.make_variant_vertex(
+                    item,
                     discriminants.clone(),
-                    index.clone(),
-                ))),
+                    *index,
+                )))
+            }
             None => Box::new(std::iter::empty()),
-        }},
+        },
         _ => Box::new(std::iter::empty()),
+    }
+}
+
+fn resolve_enum_variant_by_candidate_value<'a>(
+    origin: Origin,
+    item_vertex: &'a Item,
+    candidate: CandidateValue<FieldValue>,
+    variant_name_index: &'a HashMap<(Id, &str), (&'a Item, usize)>,
+    item_index: &'a HashMap<Id, Item>,
+) -> VertexIterator<'a, Vertex<'a>> {
+    let vertex_id = item_vertex.id;
+
+    match candidate {
+        CandidateValue::Impossible => Box::new(std::iter::empty()),
+        CandidateValue::Single(name) => {
+            resolve_enum_variant_by_name(origin, item_vertex, name, variant_name_index, item_index)
+        }
+        CandidateValue::Multiple(values) => Box::new(values.into_iter().flat_map(move |name| {
+            resolve_enum_variant_by_name(origin, item_vertex, name, variant_name_index, item_index)
+        })),
+        _ => resolve_enum_variants_slow_path(origin, item_vertex, item_index),
     }
 }
 
@@ -654,17 +671,19 @@ pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
 ) -> ContextOutcomeIterator<'a, V, VertexIterator<'a, Vertex<'a>>> {
     match edge_name {
         "variant" => {
-            // TODO: Static value.
-            // If we know the name, we can use the variant_name_index find the corresponding
-            // variant.
+            // If the name of the variant is required to be a particular value, we can 
+            // use the variant_name_index find the corresponding variant. 
+            //
+            // There's no advantage in our implementation between knowing values
+            // statically vs dynamically, so we check the dynamic case first since
+            // it might be more specific.
             if let Some(dynamic_value) = resolve_info
                 .destination()
                 .dynamically_required_property("name")
             {
-                // println!("Dynamic Destination: {:?}", &dynamic_value);
                 return dynamic_value.resolve_with(&adapter, contexts, move |vertex, candidate| {
                     let origin = vertex.origin;
-                    let vertex_item = vertex.as_item().expect("vertex is not an item.");
+                    let item_vertex = vertex.as_item().expect("vertex is not an item.");
 
                     let variant_name_index = match origin {
                         Origin::CurrentCrate => adapter
@@ -681,32 +700,87 @@ pub(super) fn resolve_enum_edge<'a, V: AsVertex<Vertex<'a>> + 'a>(
                             .as_ref()
                             .expect("variant_name_index was never constructed."),
                     };
-                    // println!("{:?} {:?}, {:?}", vertex_item.name, origin, candidate);
 
-                    match candidate {
-                        CandidateValue::Impossible => Box::new(std::iter::empty()),
-                        CandidateValue::Single(name) => resolve_enum_variant_by_name(
-                            origin,
-                            variant_name_index,
-                            vertex_item,
-                            name,
-                        ),
-                        CandidateValue::Multiple(values) => {
-                            Box::new(values.into_iter().flat_map(move |name| {
-                                resolve_enum_variant_by_name(
-                                    origin,
-                                    variant_name_index,
-                                    vertex_item,
-                                    name,
-                                )
-                            }))
+                    let item_index = match origin {
+                        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
+                        Origin::PreviousCrate => {
+                            &adapter
+                                .previous_crate
+                                .expect("no previous crate provided")
+                                .own_crate
+                                .inner
+                                .index
                         }
-                        _ => resolve_enum_variants_slow_path(adapter, vertex),
-                    }
+                    };
+
+                    resolve_enum_variant_by_candidate_value(
+                        origin,
+                        item_vertex,
+                        candidate,
+                        variant_name_index,
+                        item_index,
+                    )
+                });
+            } else if let Some(name_value) = resolve_info.destination().statically_required_property("name") {
+                return resolve_neighbors_with(contexts, move |vertex| {
+                    let origin = vertex.origin;
+                    let item_vertex = vertex.as_item().expect("vertex is not an item.");
+
+                    let variant_name_index = match origin {
+                        Origin::CurrentCrate => adapter
+                            .current_crate
+                            .own_crate
+                            .variant_name_index
+                            .as_ref()
+                            .expect("variant_name_index was never constructed."),
+                        Origin::PreviousCrate => adapter
+                            .previous_crate
+                            .expect("no previous crate provided")
+                            .own_crate
+                            .variant_name_index
+                            .as_ref()
+                            .expect("variant_name_index was never constructed."),
+                    };
+
+                    let item_index = match origin {
+                        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
+                        Origin::PreviousCrate => {
+                            &adapter
+                                .previous_crate
+                                .expect("no previous crate provided")
+                                .own_crate
+                                .inner
+                                .index
+                        }
+                    };
+
+                    resolve_enum_variant_by_candidate_value(
+                        origin,
+                        item_vertex,
+                        name_value.clone(),
+                        variant_name_index,
+                        item_index,
+                    )
                 });
             } else {
-                resolve_neighbors_with(contexts, |vertex| {
-                    resolve_enum_variants_slow_path(adapter, vertex)
+                resolve_neighbors_with(contexts, move |vertex| {
+                    let item_index = match vertex.origin {
+                        Origin::CurrentCrate => &adapter.current_crate.own_crate.inner.index,
+                        Origin::PreviousCrate => {
+                            &adapter
+                                .previous_crate
+                                .expect("no previous crate provided")
+                                .own_crate
+                                .inner
+                                .index
+                        }
+                    };
+
+                    resolve_enum_variants_slow_path(
+                        vertex.origin,
+                        vertex.as_item().unwrap(),
+                        item_index,
+                    )
                 })
             }
         }
